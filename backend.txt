@@ -1,0 +1,2111 @@
+/**
+ * ============================================================================
+ * SISTEM INFORMASI ABSENSI RFID, KIOSK MONITOR, & JURNAL GURU
+ * Backend Engine: Next.js App Router Single-File (app/api/[[...route]]/route.js)
+ * ============================================================================
+ */
+
+import { NextResponse } from 'next/server';
+import crypto from 'crypto';
+import { google } from 'googleapis';
+import nodemailer from 'nodemailer';
+
+const CACHE_KIOSK_KEY = 'LATEST_KIOSK_TAP_DATA';
+const SESSION_TTL_SECONDS = 21600; // 6 Jam
+const SPREADSHEET_ID = process.env.GOOGLE_SHEET_ID;
+
+/**
+ * ============================================================================
+ * IN-MEMORY CACHE & SCRIPT LOCK (Pengganti CacheService & LockService)
+ * ============================================================================
+ */
+const globalForApp = globalThis;
+
+if (!globalForApp.__memoryCache) {
+  globalForApp.__memoryCache = new Map();
+}
+
+if (!globalForApp.__mutexQueue) {
+  globalForApp.__mutexQueue = {
+    locked: false,
+    waiters: [],
+  };
+}
+
+const scriptCache = {
+  get(key) {
+    const entry = globalForApp.__memoryCache.get(key);
+    if (!entry) return null;
+    if (Date.now() > entry.expiresAt) {
+      globalForApp.__memoryCache.delete(key);
+      return null;
+    }
+    return entry.value;
+  },
+  put(key, value, expirationInSeconds = 600) {
+    globalForApp.__memoryCache.set(key, {
+      value: String(value),
+      expiresAt: Date.now() + expirationInSeconds * 1000,
+    });
+  },
+  remove(key) {
+    globalForApp.__memoryCache.delete(key);
+  },
+};
+
+function releaseScriptLock_() {
+  const mutex = globalForApp.__mutexQueue;
+  if (mutex.waiters.length > 0) {
+    const next = mutex.waiters.shift();
+    next();
+  } else {
+    mutex.locked = false;
+  }
+}
+
+async function waitScriptLock_(timeoutMs = 10000) {
+  const mutex = globalForApp.__mutexQueue;
+  if (!mutex.locked) {
+    mutex.locked = true;
+    return () => releaseScriptLock_();
+  }
+
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      const idx = mutex.waiters.indexOf(grantLock);
+      if (idx !== -1) mutex.waiters.splice(idx, 1);
+      reject(new Error('LOCK_TIMEOUT'));
+    }, timeoutMs);
+
+    function grantLock() {
+      clearTimeout(timer);
+      resolve(() => releaseScriptLock_());
+    }
+
+    mutex.waiters.push(grantLock);
+  });
+}
+
+/**
+ * ============================================================================
+ * GOOGLE SHEETS API HELPER (Pengganti SpreadsheetApp)
+ * ============================================================================
+ */
+function getSheetsClient_() {
+  const auth = new google.auth.GoogleAuth({
+    credentials: {
+      client_email: process.env.GOOGLE_CLIENT_EMAIL,
+      private_key: (process.env.GOOGLE_PRIVATE_KEY || '').replace(/\\n/g, '\n'),
+    },
+    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+  });
+  return google.sheets({ version: 'v4', auth });
+}
+
+function colIndexToLetter_(colIndex1Based) {
+  let temp = colIndex1Based;
+  let letter = '';
+  while (temp > 0) {
+    const rem = (temp - 1) % 26;
+    letter = String.fromCharCode(65 + rem) + letter;
+    temp = Math.floor((temp - 1) / 26);
+  }
+  return letter;
+}
+
+async function getAppContext_() {
+  const sheets = getSheetsClient_();
+  const res = await sheets.spreadsheets.get({
+    spreadsheetId: SPREADSHEET_ID,
+    fields: 'properties.timeZone,sheets.properties(sheetId,title)',
+  });
+  const tz = res.data.properties?.timeZone || process.env.APP_TIMEZONE || 'Asia/Jakarta';
+  const sheetList = (res.data.sheets || []).map((s) => ({
+    sheetId: s.properties.sheetId,
+    title: s.properties.title,
+  }));
+  return { tz, sheetList };
+}
+
+async function getSheetValues_(sheetName) {
+  const sheets = getSheetsClient_();
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: SPREADSHEET_ID,
+    range: `${sheetName}!A:Z`,
+  });
+  return res.data.values || [];
+}
+
+async function appendRow_(sheetName, rowArray) {
+  const sheets = getSheetsClient_();
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: SPREADSHEET_ID,
+    range: `${sheetName}!A1`,
+    valueInputOption: 'RAW',
+    insertDataOption: 'INSERT_ROWS',
+    requestBody: {
+      values: [rowArray],
+    },
+  });
+}
+
+async function setRangeValues_(sheetName, startRow1, startCol1, numRows, numCols, values2D) {
+  const sheets = getSheetsClient_();
+  const startColLetter = colIndexToLetter_(startCol1);
+  const endColLetter = colIndexToLetter_(startCol1 + numCols - 1);
+  const endRow1 = startRow1 + numRows - 1;
+  const range = `${sheetName}!${startColLetter}${startRow1}:${endColLetter}${endRow1}`;
+
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: SPREADSHEET_ID,
+    range,
+    valueInputOption: 'RAW',
+    requestBody: {
+      values: values2D,
+    },
+  });
+}
+
+async function deleteSheetRow_(sheetName, rowIndex1Based) {
+  const sheets = getSheetsClient_();
+  const { sheetList } = await getAppContext_();
+  const target = sheetList.find((s) => s.title === sheetName);
+  if (!target) return;
+
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId: SPREADSHEET_ID,
+    requestBody: {
+      requests: [
+        {
+          deleteDimension: {
+            range: {
+              sheetId: target.sheetId,
+              dimension: 'ROWS',
+              startIndex: rowIndex1Based - 1,
+              endIndex: rowIndex1Based,
+            },
+          },
+        },
+      ],
+    },
+  });
+}
+
+async function createSheetIfNotExists_(sheetName) {
+  const sheets = getSheetsClient_();
+  const { sheetList } = await getAppContext_();
+  const existing = sheetList.find((s) => s.title === sheetName);
+  if (existing) return existing.sheetId;
+
+  const res = await sheets.spreadsheets.batchUpdate({
+    spreadsheetId: SPREADSHEET_ID,
+    requestBody: {
+      requests: [{ addSheet: { properties: { title: sheetName } } }],
+    },
+  });
+  return res.data.replies[0].addSheet.properties.sheetId;
+}
+
+async function formatHeaderStyle_(sheetId, numCols) {
+  const sheets = getSheetsClient_();
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId: SPREADSHEET_ID,
+    requestBody: {
+      requests: [
+        {
+          repeatCell: {
+            range: {
+              sheetId,
+              startRowIndex: 0,
+              endRowIndex: 1,
+              startColumnIndex: 0,
+              endColumnIndex: numCols,
+            },
+            cell: {
+              userEnteredFormat: {
+                backgroundColor: { red: 30 / 255, green: 41 / 255, blue: 59 / 255 },
+                textFormat: {
+                  foregroundColor: { red: 1, green: 1, blue: 1 },
+                  bold: true,
+                },
+              },
+            },
+            fields: 'userEnteredFormat(backgroundColor,textFormat)',
+          },
+        },
+        {
+          updateSheetProperties: {
+            properties: {
+              sheetId,
+              gridProperties: { frozenRowCount: 1 },
+            },
+            fields: 'gridProperties.frozenRowCount',
+          },
+        },
+      ],
+    },
+  });
+}
+
+async function deleteSheetById_(sheetId) {
+  const sheets = getSheetsClient_();
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId: SPREADSHEET_ID,
+    requestBody: {
+      requests: [{ deleteSheet: { sheetId } }],
+    },
+  });
+}
+
+/**
+ * ============================================================================
+ * 1. INISIALISASI DATABASE OTOMATIS (7 SHEET UTAMA)
+ * ============================================================================
+ */
+async function setupDatabase() {
+  const { tz } = await getAppContext_();
+
+  const schema = {
+    Users: ['ID_User', 'Username', 'Password', 'Nama_Lengkap', 'Role', 'Wali_Kelas', 'Status', 'Kontak_Reset'],
+    Siswa: ['NIS', 'UID_RFID', 'Nama_Siswa', 'Jenis_Kelamin', 'Kelas', 'No_WA_Ortu', 'Foto_URL', 'Status'],
+    Absensi: ['ID_Absensi', 'Tanggal', 'Jam_Masuk', 'Jam_Pulang', 'UID_RFID', 'NIS', 'Nama_Siswa', 'Kelas', 'Status', 'Keterangan'],
+    Jurnal_Guru: ['ID_Jurnal', 'Tanggal', 'Jam_Ke', 'ID_Guru', 'Nama_Guru', 'Kelas', 'Mata_Pelajaran', 'Materi', 'Catatan_Kejadian', 'Ringkasan_Absensi'],
+    Hari_Libur: ['Tanggal', 'Keterangan'],
+    Audit_Log: ['Timestamp', 'User', 'Aksi', 'Detail_Perubahan'],
+    Pengaturan: ['Key', 'Value'],
+  };
+
+  for (const sheetName of Object.keys(schema)) {
+    const sheetId = await createSheetIfNotExists_(sheetName);
+    const existingRows = await getSheetValues_(sheetName);
+    if (existingRows.length === 0) {
+      const headers = schema[sheetName];
+      await setRangeValues_(sheetName, 1, 1, 1, headers.length, [headers]);
+      await formatHeaderStyle_(sheetId, headers.length);
+    }
+  }
+
+  // Hapus Sheet1 bawaan jika kosong dan ada sheet lain
+  const refreshedMeta = await getAppContext_();
+  const defaultSheet = refreshedMeta.sheetList.find((s) => s.title === 'Sheet1');
+  if (defaultSheet && refreshedMeta.sheetList.length > 1) {
+    const s1Rows = await getSheetValues_('Sheet1');
+    if (s1Rows.length === 0) {
+      await deleteSheetById_(defaultSheet.sheetId);
+    }
+  }
+
+  // Isi Data Default Pengaturan jika masih kosong
+  const settingRows = await getSheetValues_('Pengaturan');
+  if (settingRows.length <= 1) {
+    const defaultSettings = [
+      ['Nama_Sekolah', 'SMA NEGERI 1 NUSANTARA'],
+      ['Alamat_Sekolah', 'Jl. Merdeka Pendidikan No. 45, Kota Nusantara'],
+      ['Tahun_Ajaran', '2026/2027'],
+      ['Nama_Kepsek', 'Drs. H. Ahmad Fauzi, M.Pd.'],
+      ['NIP_Kepsek', '19700512 199512 1 001'],
+      ['Batas_Jam_Masuk', '07:15'],
+      ['Batas_Jam_Pulang', '15:00'],
+      ['API_Key_RFID', 'RFID-KEY-' + Math.floor(100000 + Math.random() * 900000)],
+      ['WA_API_URL', 'https://api.fonnte.com/send'],
+      ['WA_API_TOKEN', ''],
+      ['WA_Aktif', 'FALSE'],
+      ['Last_Unknown_UID', ''],
+    ];
+    await setRangeValues_('Pengaturan', 2, 1, defaultSettings.length, 2, defaultSettings);
+  }
+
+  // Isi Akun Default Users jika masih kosong (Password default: admin123, guru123, piket123)
+  const userRows = await getSheetValues_('Users');
+  if (userRows.length <= 1) {
+    const defaultUsers = [
+      ['USR-001', 'admin', 'admin123', 'Administrator Sistem', 'Admin', '', 'Aktif', ''],
+      ['USR-002', 'guru', 'guru123', 'Budi Santoso, S.Pd.', 'Guru', 'X-IPA-1', 'Aktif', ''],
+      ['USR-003', 'piket', 'piket123', 'Siti Aminah, S.Pd.', 'Piket', '', 'Aktif', ''],
+    ];
+    await setRangeValues_('Users', 2, 1, defaultUsers.length, 8, defaultUsers);
+  }
+
+  // Isi Contoh Siswa & Hari Libur jika masih kosong agar dashboard langsung hidup
+  const siswaRows = await getSheetValues_('Siswa');
+  if (siswaRows.length <= 1) {
+    const sampleSiswa = [
+      ['2026001', 'A1B2C3D4', 'Rizky Ramadhan', 'L', 'X-IPA-1', '6281234567890', '', 'Aktif'],
+      ['2026002', 'E5F6G7H8', 'Nadia Putri Lestari', 'P', 'X-IPA-1', '6281234567891', '', 'Aktif'],
+      ['2026003', '11223344', 'Dimas Pratama', 'L', 'X-IPS-1', '6281234567892', '', 'Aktif'],
+      ['2026004', '55667788', 'Aulia Zahra', 'P', 'XI-IPA-1', '6281234567893', '', 'Aktif'],
+    ];
+    await setRangeValues_('Siswa', 2, 1, sampleSiswa.length, 8, sampleSiswa);
+  }
+
+  const todayStr = formatDateTz_(new Date(), tz, 'yyyy-MM-dd');
+  await logAudit_('SYSTEM', 'SETUP_DATABASE', 'Inisialisasi struktur 7 sheet database selesai pada ' + todayStr);
+  return { success: true, message: 'Database 7 sheet berhasil diinisialisasi!' };
+}
+
+/**
+ * ============================================================================
+ * 2. ROUTING WEB APP & ENDPOINT API RFID (GET & POST)
+ * ============================================================================
+ */
+export async function GET(request) {
+  const { searchParams, pathname } = new URL(request.url);
+  const params = Object.fromEntries(searchParams.entries());
+
+  // Endpoint Cron Otomatis Auto-Alpha (/api/cron/auto-alpha)
+  if (pathname.endsWith('/cron/auto-alpha')) {
+    const authHeader = request.headers.get('authorization');
+    if (process.env.CRON_SECRET && authHeader !== `Bearer ${process.env.CRON_SECRET}`) {
+      return NextResponse.json({ status: 'error', message: 'Unauthorized' }, { status: 401 });
+    }
+    const res = await jalankanAutoAlpha();
+    return NextResponse.json(res);
+  }
+
+  // Jika request berasal dari alat RFID via GET (?uid=xxx&api_key=xxx)
+  if (params.uid || params.action === 'rfid') {
+    const res = await handleRfidSingleTap_(params);
+    return NextResponse.json(res);
+  }
+
+  // Pastikan database minimal sudah siap saat pertama kali dibuka
+  const { sheetList } = await getAppContext_();
+  if (!sheetList.some((s) => s.title === 'Pengaturan')) {
+    await setupDatabase();
+  }
+
+  return NextResponse.json({
+    status: 'ok',
+    message: 'Sistem Informasi Absensi RFID & Jurnal Guru API Aktif',
+  });
+}
+
+export async function POST(request) {
+  let payload = {};
+  try {
+    const contentType = request.headers.get('content-type') || '';
+    if (contentType.includes('application/json')) {
+      payload = await request.json();
+    } else if (
+      contentType.includes('application/x-www-form-urlencoded') ||
+      contentType.includes('multipart/form-data')
+    ) {
+      const formData = await request.formData();
+      payload = Object.fromEntries(formData.entries());
+    } else {
+      const rawText = await request.text();
+      if (rawText) {
+        payload = JSON.parse(rawText);
+      }
+    }
+  } catch (err) {
+    return NextResponse.json({
+      status: 'error',
+      pesan: 'Format JSON tidak valid: ' + err.message,
+    });
+  }
+
+  // Mendukung pemanggilan RPC fungsi backend dari frontend ({ action, args })
+  if (payload && typeof payload.action === 'string' && Array.isArray(payload.args)) {
+    const RPC_METHODS = {
+      setupDatabase,
+      processKioskUsbTap,
+      getKioskData,
+      loginUser,
+      checkSession,
+      logoutUser,
+      getDashboardData,
+      getSiswaList,
+      getLastUnknownUid,
+      saveSiswa,
+      deleteSiswa,
+      importSiswaBulk,
+      getAbsensiManualData,
+      saveAbsensiManual,
+      getRingkasanAbsensiKelas,
+      getJurnalList,
+      saveJurnalGuru,
+      deleteJurnalGuru,
+      getRekapBulanan,
+      jalankanAutoAlpha,
+      installAutoAlphaTrigger,
+      getUsersList,
+      getGuruDropdownList,
+      saveUser,
+      deleteUser,
+      getPengaturan,
+      savePengaturan,
+      getHariLibur,
+      saveHariLibur,
+      deleteHariLibur,
+      getAuditLog,
+      requestPasswordReset,
+      confirmPasswordReset,
+    };
+
+    const fn = RPC_METHODS[payload.action];
+    if (!fn) {
+      return NextResponse.json(
+        { success: false, message: `Fungsi "${payload.action}" tidak ditemukan.` },
+        { status: 400 }
+      );
+    }
+
+    try {
+      const result = await fn(...payload.args);
+      return NextResponse.json({ success: true, data: result });
+    } catch (err) {
+      return NextResponse.json(
+        { success: false, message: err.message || 'Terjadi kesalahan pada server.' },
+        { status: 400 }
+      );
+    }
+  }
+
+  // Mendukung Offline Batch Sync dari ESP32 (array logs)
+  if (Array.isArray(payload.batch)) {
+    const apiKey = payload.api_key || '';
+    const settings = await getSettingsMap_();
+    if (!apiKey || apiKey !== settings.API_Key_RFID) {
+      return NextResponse.json({
+        status: 'error',
+        pesan: 'API Key Tidak Valid',
+      });
+    }
+
+    const results = [];
+    for (const item of payload.batch) {
+      const r = await handleRfidSingleTap_({
+        api_key: apiKey,
+        uid: item.uid,
+        timestamp: item.timestamp || '',
+        is_offline_sync: true,
+      });
+      results.push(r);
+    }
+
+    return NextResponse.json({
+      status: 'success',
+      synced_count: results.length,
+      results: results,
+      pesan: 'Sinkronisasi batch selesai',
+    });
+  }
+
+  // Single tap via POST
+  const res = await handleRfidSingleTap_(payload);
+  return NextResponse.json(res);
+}
+
+/**
+ * Logika Inti Pemrosesan Tap Kartu RFID
+ */
+async function handleRfidSingleTap_(params) {
+  let releaseLock;
+  try {
+    releaseLock = await waitScriptLock_(10000);
+  } catch (e) {
+    return { status: 'error', pesan: 'Server Sibuk, Coba Lagi' };
+  }
+
+  try {
+    const { tz } = await getAppContext_();
+    const settings = await getSettingsMap_();
+
+    // 1. Validasi API Key
+    const apiKey = String(params.api_key || '').trim();
+    if (!apiKey || apiKey !== String(settings.API_Key_RFID || '').trim()) {
+      return { status: 'error', code: 'INVALID_KEY', pesan: 'API Key Salah' };
+    }
+
+    // 2. Validasi UID
+    const uid = String(params.uid || '').trim().toUpperCase();
+    if (!uid) {
+      return { status: 'error', code: 'EMPTY_UID', pesan: 'UID Kosong' };
+    }
+
+    // 3. Tentukan Waktu Tap (mendukung timestamp offline dari ESP32)
+    let tapDateObj = new Date();
+    const isOfflineSync = Boolean(params.is_offline_sync);
+    if (params.timestamp) {
+      const parsed = new Date(params.timestamp);
+      if (!isNaN(parsed.getTime())) {
+        tapDateObj = parsed;
+      }
+    }
+
+    const tanggalStr = formatDateTz_(tapDateObj, tz, 'yyyy-MM-dd');
+    const jamFullStr = formatDateTz_(tapDateObj, tz, 'HH:mm:ss');
+    const jamMenitStr = formatDateTz_(tapDateObj, tz, 'HH:mm');
+
+    // 4. Cari Siswa berdasarkan UID
+    const siswaData = await getSheetValues_('Siswa');
+    let siswaFound = null;
+
+    for (let i = 1; i < siswaData.length; i++) {
+      const rowUid = String(siswaData[i][1] || '').trim().toUpperCase();
+      const rowStatus = String(siswaData[i][7] || '').trim();
+      if (rowUid === uid && rowStatus === 'Aktif') {
+        siswaFound = {
+          nis: String(siswaData[i][0]),
+          uid: rowUid,
+          nama: String(siswaData[i][2]),
+          jk: String(siswaData[i][3]),
+          kelas: String(siswaData[i][4]),
+          noWa: String(siswaData[i][5] || ''),
+          fotoUrl: String(siswaData[i][6] || ''),
+        };
+        break;
+      }
+    }
+
+    // Jika kartu belum terdaftar, simpan ke Last_Unknown_UID
+    if (!siswaFound) {
+      await updateSingleSetting_('Last_Unknown_UID', uid);
+      return {
+        status: 'error',
+        code: 'UNREGISTERED',
+        uid: uid,
+        waktu: jamFullStr,
+        pesan: 'Kartu Tidak Terdaftar',
+      };
+    }
+
+    // 5. Cek Riwayat Absensi Hari Ini
+    const absensiData = await getSheetValues_('Absensi');
+    let existingRowIndex = -1;
+    let existingRow = null;
+
+    for (let i = 1; i < absensiData.length; i++) {
+      const rowTgl = formatCellDate_(absensiData[i][1], tz);
+      const rowNis = String(absensiData[i][5]);
+      if (rowTgl === tanggalStr && rowNis === siswaFound.nis) {
+        existingRowIndex = i + 1;
+        existingRow = absensiData[i];
+        break;
+      }
+    }
+
+    const batasMasuk = String(settings.Batas_Jam_Masuk || '07:15').trim();
+    const keteranganSync = isOfflineSync ? 'Offline Sync ESP32' : 'Tap RFID';
+
+    // KASUS A: Belum ada log hari ini -> Catat JAM MASUK
+    if (existingRowIndex === -1) {
+      const statusKehadiran = jamMenitStr <= batasMasuk ? 'Hadir' : 'Terlambat';
+      const idAbsensi = 'ABS-' + tanggalStr.replace(/-/g, '') + '-' + Math.floor(1000 + Math.random() * 9000);
+
+      await appendRow_('Absensi', [
+        idAbsensi,
+        tanggalStr,
+        jamFullStr,
+        '',
+        siswaFound.uid,
+        siswaFound.nis,
+        siswaFound.nama,
+        siswaFound.kelas,
+        statusKehadiran,
+        keteranganSync,
+      ]);
+
+      // Simpan ke Cache untuk Kiosk Monitor Real-Time
+      saveLatestKioskTap_({
+        nama: siswaFound.nama,
+        nis: siswaFound.nis,
+        kelas: siswaFound.kelas,
+        fotoUrl: siswaFound.fotoUrl,
+        waktu: jamFullStr,
+        tanggal: tanggalStr,
+        tipe_tap: 'MASUK',
+        status: statusKehadiran,
+        timestamp_ms: Date.now(),
+      });
+
+      // Kirim WA Notifikasi jika aktif & bukan sync lama
+      if (String(settings.WA_Aktif).toUpperCase() === 'TRUE' && siswaFound.noWa) {
+        const pesanWa =
+          `*[INFO ABSENSI - ${settings.Nama_Sekolah}]*\n\n` +
+          `Ananda *${siswaFound.nama}* (${siswaFound.kelas}) telah melakukan absensi *MASUK*.\n` +
+          `Tanggal: ${tanggalStr}\n` +
+          `Waktu: ${jamFullStr}\n` +
+          `Status: *${statusKehadiran}*`;
+        await kirimNotifikasiWA_(siswaFound.noWa, pesanWa, settings);
+      }
+
+      return {
+        status: 'success',
+        tipe_tap: 'Masuk',
+        nama: siswaFound.nama,
+        kelas: siswaFound.kelas,
+        waktu: jamFullStr,
+        status_kehadiran: statusKehadiran,
+        pesan: 'Masuk: ' + statusKehadiran,
+      };
+    }
+
+    // KASUS B: Sudah ada log hari ini -> Cek Double Tap (< 5 menit) lalu Catat JAM PULANG
+    const jamMasukExisting = formatCellTime_(existingRow[2], tz);
+    const jamPulangExisting = formatCellTime_(existingRow[3], tz);
+
+    const diffFromMasuk = calcMinutesDiff_(jamMasukExisting, jamFullStr);
+    if (diffFromMasuk >= 0 && diffFromMasuk < 5) {
+      return {
+        status: 'warning',
+        code: 'DOUBLE_TAP',
+        tipe_tap: 'Masuk',
+        nama: siswaFound.nama,
+        kelas: siswaFound.kelas,
+        waktu: jamFullStr,
+        pesan: 'Sudah Absen Masuk',
+      };
+    }
+
+    if (jamPulangExisting) {
+      const diffFromPulang = calcMinutesDiff_(jamPulangExisting, jamFullStr);
+      if (diffFromPulang >= 0 && diffFromPulang < 5) {
+        return {
+          status: 'warning',
+          code: 'DOUBLE_TAP',
+          tipe_tap: 'Pulang',
+          nama: siswaFound.nama,
+          kelas: siswaFound.kelas,
+          waktu: jamFullStr,
+          pesan: 'Sudah Absen Pulang',
+        };
+      }
+    }
+
+    // Update kolom Jam_Pulang (kolom ke-4)
+    await setRangeValues_('Absensi', existingRowIndex, 4, 1, 1, [[jamFullStr]]);
+
+    saveLatestKioskTap_({
+      nama: siswaFound.nama,
+      nis: siswaFound.nis,
+      kelas: siswaFound.kelas,
+      fotoUrl: siswaFound.fotoUrl,
+      waktu: jamFullStr,
+      tanggal: tanggalStr,
+      tipe_tap: 'PULANG',
+      status: String(existingRow[8] || 'Hadir'),
+      timestamp_ms: Date.now(),
+    });
+
+    if (String(settings.WA_Aktif).toUpperCase() === 'TRUE' && siswaFound.noWa) {
+      const pesanWa =
+        `*[INFO ABSENSI - ${settings.Nama_Sekolah}]*\n\n` +
+        `Ananda *${siswaFound.nama}* (${siswaFound.kelas}) telah melakukan absensi *PULANG*.\n` +
+        `Tanggal: ${tanggalStr}\n` +
+        `Waktu: ${jamFullStr}`;
+      await kirimNotifikasiWA_(siswaFound.noWa, pesanWa, settings);
+    }
+
+    return {
+      status: 'success',
+      tipe_tap: 'Pulang',
+      nama: siswaFound.nama,
+      kelas: siswaFound.kelas,
+      waktu: jamFullStr,
+      pesan: 'Pulang Tercatat',
+    };
+  } finally {
+    if (releaseLock) releaseLock();
+  }
+}
+
+/**
+ * Fungsi Modular Pengiriman Notifikasi WhatsApp Gateway
+ */
+async function kirimNotifikasiWA_(noTujuan, pesan, settingsObj) {
+  try {
+    const settings = settingsObj || (await getSettingsMap_());
+    const url = String(settings.WA_API_URL || '').trim();
+    const token = String(settings.WA_API_TOKEN || '').trim();
+    if (!url || !token || !noTujuan) return false;
+
+    const formBody = new URLSearchParams({
+      target: String(noTujuan).replace(/[^0-9]/g, ''),
+      message: pesan,
+    });
+
+    await fetch(url, {
+      method: 'POST',
+      headers: {
+        Authorization: token,
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: formBody.toString(),
+    });
+    return true;
+  } catch (e) {
+    console.error('Gagal kirim WA: ' + e.message);
+    return false;
+  }
+}
+
+/**
+ * ============================================================================
+ * 3. KIOSK MONITOR REAL-TIME ENDPOINT & USB RFID READER
+ * ============================================================================
+ */
+function saveLatestKioskTap_(tapObj) {
+  scriptCache.put(CACHE_KIOSK_KEY, JSON.stringify(tapObj), 21600);
+}
+
+async function processKioskUsbTap(uid) {
+  const settings = await getSettingsMap_();
+  return handleRfidSingleTap_({
+    api_key: settings.API_Key_RFID,
+    uid: uid,
+  });
+}
+
+async function getKioskData() {
+  const { tz, sheetList } = await getAppContext_();
+  if (!sheetList.some((s) => s.title === 'Pengaturan')) {
+    await setupDatabase();
+  }
+
+  const settings = await getSettingsMap_();
+  const todayStr = formatDateTz_(new Date(), tz, 'yyyy-MM-dd');
+
+  const cachedRaw = scriptCache.get(CACHE_KIOSK_KEY);
+  let latestTap = cachedRaw ? JSON.parse(cachedRaw) : null;
+
+  // Hitung ringkasan hari ini & fallback latestTap jika cache kosong
+  const absensiData = await getSheetValues_('Absensi');
+  const siswaData = await getSheetValues_('Siswa');
+
+  const fotoMap = {};
+  let totalAktif = 0;
+  for (let i = 1; i < siswaData.length; i++) {
+    if (String(siswaData[i][7]) === 'Aktif') {
+      totalAktif++;
+      fotoMap[String(siswaData[i][0])] = String(siswaData[i][6] || '');
+    }
+  }
+
+  let hadir = 0;
+  let terlambat = 0;
+  let lastRowToday = null;
+
+  for (let i = 1; i < absensiData.length; i++) {
+    const tgl = formatCellDate_(absensiData[i][1], tz);
+    if (tgl === todayStr) {
+      const st = String(absensiData[i][8]);
+      if (st === 'Hadir') hadir++;
+      if (st === 'Terlambat') terlambat++;
+      lastRowToday = absensiData[i];
+    }
+  }
+
+  if (!latestTap && lastRowToday) {
+    const jamPulang = formatCellTime_(lastRowToday[3], tz);
+    const jamMasuk = formatCellTime_(lastRowToday[2], tz);
+    latestTap = {
+      nama: String(lastRowToday[6]),
+      nis: String(lastRowToday[5]),
+      kelas: String(lastRowToday[7]),
+      fotoUrl: fotoMap[String(lastRowToday[5])] || '',
+      waktu: jamPulang || jamMasuk,
+      tanggal: todayStr,
+      tipe_tap: jamPulang ? 'PULANG' : 'MASUK',
+      status: String(lastRowToday[8]),
+      timestamp_ms: 0,
+    };
+  }
+
+  return {
+    sekolah: {
+      nama: settings.Nama_Sekolah || 'Sekolah',
+      alamat: settings.Alamat_Sekolah || '',
+      tahunAjaran: settings.Tahun_Ajaran || '',
+    },
+    stats: {
+      totalAktif: totalAktif,
+      hadir: hadir,
+      terlambat: terlambat,
+      belumAbsen: Math.max(0, totalAktif - (hadir + terlambat)),
+    },
+    latestTap: latestTap,
+  };
+}
+
+/**
+ * ============================================================================
+ * 4. AUTENTIKASI LOGIN, SESSION, & AUDIT LOG
+ * ============================================================================
+ */
+async function loginUser(username, password) {
+  const { sheetList } = await getAppContext_();
+  if (!sheetList.some((s) => s.title === 'Users')) {
+    await setupDatabase();
+  }
+
+  const data = await getSheetValues_('Users');
+  const inputUser = String(username || '').trim().toLowerCase();
+  const inputPass = String(password || '').trim();
+
+  for (let i = 1; i < data.length; i++) {
+    const dbUser = String(data[i][1] || '').trim().toLowerCase();
+    const dbPass = String(data[i][2] || '').trim();
+    const dbStatus = String(data[i][6] || '').trim();
+
+    if (dbUser === inputUser && dbPass === inputPass) {
+      if (dbStatus !== 'Aktif') {
+        return { success: false, message: 'Akun Anda dinonaktifkan. Hubungi Admin.' };
+      }
+
+      const token = crypto.randomUUID();
+      const userProfile = {
+        idUser: String(data[i][0]),
+        username: String(data[i][1]),
+        namaLengkap: String(data[i][3]),
+        role: String(data[i][4]),
+        waliKelas: String(data[i][5] || ''),
+      };
+
+      scriptCache.put('SESSION_' + token, JSON.stringify(userProfile), SESSION_TTL_SECONDS);
+      await logAudit_(userProfile.namaLengkap, 'LOGIN', `Login berhasil (${userProfile.role})`);
+
+      return {
+        success: true,
+        token: token,
+        user: userProfile,
+      };
+    }
+  }
+
+  return { success: false, message: 'Username atau password salah.' };
+}
+
+function checkSession(token) {
+  if (!token) return { valid: false };
+  const raw = scriptCache.get('SESSION_' + token);
+  if (!raw) return { valid: false };
+  return { valid: true, user: JSON.parse(raw) };
+}
+
+function logoutUser(token) {
+  if (token) {
+    scriptCache.remove('SESSION_' + token);
+  }
+  return { success: true };
+}
+
+function requireAuth_(token, allowedRoles) {
+  const session = checkSession(token);
+  if (!session.valid) {
+    throw new Error('Sesi berakhir atau tidak valid. Silakan login ulang.');
+  }
+  if (allowedRoles && allowedRoles.length > 0 && !allowedRoles.includes(session.user.role)) {
+    throw new Error('Anda tidak memiliki hak akses untuk tindakan ini.');
+  }
+  return session.user;
+}
+
+async function logAudit_(user, aksi, detail) {
+  try {
+    const { tz, sheetList } = await getAppContext_();
+    if (!sheetList.some((s) => s.title === 'Audit_Log')) return;
+    const nowStr = formatDateTz_(new Date(), tz, 'yyyy-MM-dd HH:mm:ss');
+    await appendRow_('Audit_Log', [nowStr, user, aksi, detail]);
+  } catch (e) {
+    console.error('Audit log error: ' + e.message);
+  }
+}
+
+/**
+ * ============================================================================
+ * 5. DASHBOARD INFOGRAFIS PER KELAS & EARLY WARNING SYSTEM
+ * ============================================================================
+ */
+async function getDashboardData(token, filterKelas, filterPeriode, customStart, customEnd) {
+  requireAuth_(token);
+  const { tz } = await getAppContext_();
+
+  const siswaRows = await getSheetValues_('Siswa');
+  const absensiRows = await getSheetValues_('Absensi');
+
+  // Hitung rentang tanggal filter
+  const now = new Date();
+  const todayStr = formatDateTz_(now, tz, 'yyyy-MM-dd');
+  let startStr = todayStr;
+  let endStr = todayStr;
+
+  if (filterPeriode === 'week') {
+    const d = new Date(now);
+    d.setDate(d.getDate() - 6);
+    startStr = formatDateTz_(d, tz, 'yyyy-MM-dd');
+  } else if (filterPeriode === 'month') {
+    startStr = todayStr.slice(0, 8) + '01';
+  } else if (filterPeriode === 'custom' && customStart && customEnd) {
+    startStr = customStart;
+    endStr = customEnd;
+  }
+
+  // Kumpulkan daftar kelas & siswa aktif
+  const kelasSet = new Set();
+  const activeStudents = [];
+  const totalPerKelas = {};
+
+  for (let i = 1; i < siswaRows.length; i++) {
+    if (String(siswaRows[i][7]) === 'Aktif') {
+      const kls = String(siswaRows[i][4]).trim();
+      kelasSet.add(kls);
+      totalPerKelas[kls] = (totalPerKelas[kls] || 0) + 1;
+
+      if (!filterKelas || filterKelas === 'ALL' || kls === filterKelas) {
+        activeStudents.push({
+          nis: String(siswaRows[i][0]),
+          nama: String(siswaRows[i][2]),
+          kelas: kls,
+        });
+      }
+    }
+  }
+
+  const kelasList = Array.from(kelasSet).sort();
+
+  // Agregasi KPI, Grafik Per Kelas, Tren Harian, Early Warning & Live Feed
+  let hadir = 0;
+  let terlambat = 0;
+  let sakit = 0;
+  let izin = 0;
+  let alpha = 0;
+
+  const kelasPresentMap = {};
+  kelasList.forEach((k) => {
+    kelasPresentMap[k] = { hadir: 0, totalLog: 0 };
+  });
+
+  // Tren 14 hari terakhir
+  const trendDates = [];
+  const trendMap = {};
+  for (let d = 13; d >= 0; d--) {
+    const dt = new Date(now);
+    dt.setDate(dt.getDate() - d);
+    const ds = formatDateTz_(dt, tz, 'yyyy-MM-dd');
+    trendDates.push(ds);
+    trendMap[ds] = { hadir: 0, terlambat: 0, tidakHadir: 0 };
+  }
+
+  // Early Warning Bulan Ini
+  const currentMonthPrefix = todayStr.slice(0, 7);
+  const warningStats = {}; // nis -> { nama, kelas, terlambat, alpha }
+  const liveFeedToday = [];
+
+  for (let i = 1; i < absensiRows.length; i++) {
+    const tgl = formatCellDate_(absensiRows[i][1], tz);
+    const jamMasuk = formatCellTime_(absensiRows[i][2], tz);
+    const jamPulang = formatCellTime_(absensiRows[i][3], tz);
+    const nis = String(absensiRows[i][5]);
+    const nama = String(absensiRows[i][6]);
+    const kls = String(absensiRows[i][7]).trim();
+    const st = String(absensiRows[i][8]);
+
+    // 1. Live Feed Hari Ini
+    if (tgl === todayStr) {
+      if (!filterKelas || filterKelas === 'ALL' || kls === filterKelas) {
+        liveFeedToday.push({
+          id: String(absensiRows[i][0]),
+          nis: nis,
+          nama: nama,
+          kelas: kls,
+          jamMasuk: jamMasuk || '-',
+          jamPulang: jamPulang || '-',
+          status: st,
+        });
+      }
+    }
+
+    // 2. Tren 14 Hari Terakhir
+    if (trendMap[tgl] && (!filterKelas || filterKelas === 'ALL' || kls === filterKelas)) {
+      if (st === 'Hadir') trendMap[tgl].hadir++;
+      else if (st === 'Terlambat') trendMap[tgl].terlambat++;
+      else trendMap[tgl].tidakHadir++;
+    }
+
+    // 3. Early Warning Bulan Berjalan
+    if (tgl.startsWith(currentMonthPrefix)) {
+      if (!filterKelas || filterKelas === 'ALL' || kls === filterKelas) {
+        if (!warningStats[nis]) {
+          warningStats[nis] = { nis, nama, kelas: kls, terlambat: 0, alpha: 0 };
+        }
+        if (st === 'Terlambat') warningStats[nis].terlambat++;
+        if (st === 'Alpha') warningStats[nis].alpha++;
+      }
+    }
+
+    // 4. Filter Rentang Waktu Utama
+    if (tgl >= startStr && tgl <= endStr) {
+      if (kelasPresentMap[kls]) {
+        kelasPresentMap[kls].totalLog++;
+        if (st === 'Hadir' || st === 'Terlambat') {
+          kelasPresentMap[kls].hadir++;
+        }
+      }
+
+      if (!filterKelas || filterKelas === 'ALL' || kls === filterKelas) {
+        if (st === 'Hadir') hadir++;
+        else if (st === 'Terlambat') terlambat++;
+        else if (st === 'Sakit') sakit++;
+        else if (st === 'Izin') izin++;
+        else if (st === 'Alpha') alpha++;
+      }
+    }
+  }
+
+  const totalLogFiltered = hadir + terlambat + sakit + izin + alpha;
+  const persentaseKehadiran =
+    totalLogFiltered > 0 ? Math.round(((hadir + terlambat) / totalLogFiltered) * 1000) / 10 : 0;
+
+  // Bar Chart Antar Kelas
+  const barLabels = kelasList;
+  const barValues = kelasList.map((k) => {
+    const obj = kelasPresentMap[k];
+    if (!obj || obj.totalLog === 0) return 0;
+    return Math.round((obj.hadir / obj.totalLog) * 100);
+  });
+
+  // Early Warning List (Terlambat >= 3 atau Alpha >= 2)
+  const earlyWarningList = Object.values(warningStats)
+    .filter((w) => w.terlambat >= 3 || w.alpha >= 2)
+    .sort((a, b) => b.alpha * 2 + b.terlambat - (a.alpha * 2 + a.terlambat))
+    .slice(0, 10);
+
+  return {
+    kelasList: kelasList,
+    kpi: {
+      totalSiswa: activeStudents.length,
+      hadir: hadir,
+      terlambat: terlambat,
+      sakitIzin: sakit + izin,
+      alpha: alpha,
+      persentase: persentaseKehadiran,
+    },
+    charts: {
+      doughnut: [hadir, terlambat, izin, sakit, alpha],
+      bar: { labels: barLabels, values: barValues },
+      trend: {
+        labels: trendDates.map((d) => d.slice(5)), // MM-DD
+        hadir: trendDates.map((d) => trendMap[d].hadir),
+        terlambat: trendDates.map((d) => trendMap[d].terlambat),
+        tidakHadir: trendDates.map((d) => trendMap[d].tidakHadir),
+      },
+    },
+    earlyWarning: earlyWarningList,
+    liveFeed: liveFeedToday.reverse().slice(0, 15),
+  };
+}
+
+/**
+ * ============================================================================
+ * 6. MANAJEMEN DATA SISWA, IMPORT CSV, & ABSENSI MANUAL
+ * ============================================================================
+ */
+async function getSiswaList(token) {
+  requireAuth_(token);
+  const data = await getSheetValues_('Siswa');
+  const list = [];
+  for (let i = 1; i < data.length; i++) {
+    list.push({
+      nis: String(data[i][0] || ''),
+      uid: String(data[i][1] || ''),
+      nama: String(data[i][2] || ''),
+      jk: String(data[i][3] || ''),
+      kelas: String(data[i][4] || ''),
+      noWa: String(data[i][5] || ''),
+      fotoUrl: String(data[i][6] || ''),
+      status: String(data[i][7] || ''),
+    });
+  }
+  return list;
+}
+
+async function getLastUnknownUid(token) {
+  requireAuth_(token);
+  const settings = await getSettingsMap_();
+  return settings.Last_Unknown_UID || '';
+}
+
+async function saveSiswa(token, form) {
+  const user = requireAuth_(token, ['Admin', 'Piket']);
+  const data = await getSheetValues_('Siswa');
+
+  const nis = String(form.nis || '').trim();
+  const uid = String(form.uid || '').trim().toUpperCase();
+  const nama = String(form.nama || '').trim();
+  const jk = String(form.jk || 'L').trim();
+  const kelas = String(form.kelas || '').trim().toUpperCase();
+  const noWa = String(form.noWa || '').trim();
+  const fotoUrl = String(form.fotoUrl || '').trim();
+  const status = String(form.status || 'Aktif').trim();
+
+  if (!nis || !nama || !kelas) {
+    throw new Error('NIS, Nama Siswa, dan Kelas wajib diisi.');
+  }
+
+  let targetRow = -1;
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][0]).trim() === nis && form.isEdit) {
+      targetRow = i + 1;
+    } else if (String(data[i][0]).trim() === nis && !form.isEdit) {
+      throw new Error('NIS ' + nis + ' sudah terdaftar!');
+    }
+    if (uid && String(data[i][1] || '').trim().toUpperCase() === uid && String(data[i][0]).trim() !== nis) {
+      throw new Error('UID RFID ' + uid + ' sudah digunakan oleh siswa lain (' + data[i][2] + ')!');
+    }
+  }
+
+  const rowValues = [nis, uid, nama, jk, kelas, noWa, fotoUrl, status];
+  if (targetRow > 0) {
+    await setRangeValues_('Siswa', targetRow, 1, 1, 8, [rowValues]);
+    await logAudit_(user.namaLengkap, 'EDIT_SISWA', `Mengubah data siswa ${nama} (${nis})`);
+  } else {
+    await appendRow_('Siswa', rowValues);
+    await logAudit_(user.namaLengkap, 'TAMBAH_SISWA', `Menambahkan siswa baru ${nama} (${nis})`);
+  }
+
+  // Bersihkan Last_Unknown_UID jika UID baru saja didaftarkan
+  const settings = await getSettingsMap_();
+  if (uid && settings.Last_Unknown_UID === uid) {
+    await updateSingleSetting_('Last_Unknown_UID', '');
+  }
+
+  return { success: true, message: 'Data siswa berhasil disimpan.' };
+}
+
+async function deleteSiswa(token, nis) {
+  const user = requireAuth_(token, ['Admin']);
+  const data = await getSheetValues_('Siswa');
+
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][0]).trim() === String(nis).trim()) {
+      const nama = data[i][2];
+      await deleteSheetRow_('Siswa', i + 1);
+      await logAudit_(user.namaLengkap, 'HAPUS_SISWA', `Menghapus siswa ${nama} (${nis})`);
+      return { success: true, message: 'Data siswa berhasil dihapus.' };
+    }
+  }
+  throw new Error('Data siswa tidak ditemukan.');
+}
+
+async function importSiswaBulk(token, rowsArray) {
+  const user = requireAuth_(token, ['Admin']);
+  const existingData = await getSheetValues_('Siswa');
+
+  const existingNis = new Set();
+  for (let i = 1; i < existingData.length; i++) {
+    existingNis.add(String(existingData[i][0]).trim());
+  }
+
+  const toInsert = [];
+  let skipped = 0;
+
+  rowsArray.forEach((r) => {
+    const nis = String(r.nis || '').trim();
+    const nama = String(r.nama || '').trim();
+    const kelas = String(r.kelas || '').trim().toUpperCase();
+    if (!nis || !nama || !kelas || existingNis.has(nis)) {
+      skipped++;
+      return;
+    }
+    existingNis.add(nis);
+    toInsert.push([
+      nis,
+      String(r.uid || '').trim().toUpperCase(),
+      nama,
+      String(r.jk || 'L').trim().toUpperCase(),
+      kelas,
+      String(r.noWa || '').trim(),
+      String(r.fotoUrl || '').trim(),
+      'Aktif',
+    ]);
+  });
+
+  if (toInsert.length > 0) {
+    const startRow = Math.max(existingData.length + 1, 2);
+    await setRangeValues_('Siswa', startRow, 1, toInsert.length, 8, toInsert);
+    await logAudit_(user.namaLengkap, 'IMPORT_SISWA', `Import massal ${toInsert.length} siswa (dilewati: ${skipped})`);
+  }
+
+  return {
+    success: true,
+    inserted: toInsert.length,
+    skipped: skipped,
+    message: `Berhasil mengimpor ${toInsert.length} siswa (${skipped} dilewati karena duplikat/tidak lengkap).`,
+  };
+}
+
+/**
+ * Mengambil daftar siswa per kelas beserta status absensinya pada tanggal tertentu
+ */
+async function getAbsensiManualData(token, tanggal, kelas) {
+  requireAuth_(token);
+  const { tz } = await getAppContext_();
+  const siswaData = await getSheetValues_('Siswa');
+  const absensiData = await getSheetValues_('Absensi');
+
+  const absensiMap = {};
+  for (let i = 1; i < absensiData.length; i++) {
+    const tgl = formatCellDate_(absensiData[i][1], tz);
+    if (tgl === tanggal) {
+      absensiMap[String(absensiData[i][5])] = {
+        idAbsensi: String(absensiData[i][0]),
+        jamMasuk: formatCellTime_(absensiData[i][2], tz),
+        jamPulang: formatCellTime_(absensiData[i][3], tz),
+        status: String(absensiData[i][8]),
+        keterangan: String(absensiData[i][9] || ''),
+      };
+    }
+  }
+
+  const result = [];
+  for (let i = 1; i < siswaData.length; i++) {
+    if (String(siswaData[i][7]) === 'Aktif' && String(siswaData[i][4]).trim() === kelas) {
+      const nis = String(siswaData[i][0]);
+      const existing = absensiMap[nis];
+      result.push({
+        nis: nis,
+        uid: String(siswaData[i][1] || ''),
+        nama: String(siswaData[i][2]),
+        kelas: kelas,
+        idAbsensi: existing ? existing.idAbsensi : '',
+        jamMasuk: existing ? existing.jamMasuk : '-',
+        jamPulang: existing ? existing.jamPulang : '-',
+        status: existing ? existing.status : 'Belum Absen',
+        keterangan: existing ? existing.keterangan : '',
+      });
+    }
+  }
+  return result;
+}
+
+async function saveAbsensiManual(token, payload) {
+  const user = requireAuth_(token, ['Admin', 'Piket', 'Guru']);
+  const { tz } = await getAppContext_();
+  const data = await getSheetValues_('Absensi');
+
+  const { tanggal, nis, uid, nama, kelas, status, keterangan } = payload;
+  let targetRow = -1;
+  let oldStatus = 'Belum Absen';
+
+  for (let i = 1; i < data.length; i++) {
+    const tgl = formatCellDate_(data[i][1], tz);
+    if (tgl === tanggal && String(data[i][5]) === String(nis)) {
+      targetRow = i + 1;
+      oldStatus = String(data[i][8]);
+      break;
+    }
+  }
+
+  const ketFinal = keterangan || `Diinput manual oleh ${user.namaLengkap}`;
+
+  if (targetRow > 0) {
+    await setRangeValues_('Absensi', targetRow, 9, 1, 2, [[status, ketFinal]]);
+  } else {
+    const idAbs = 'ABS-' + tanggal.replace(/-/g, '') + '-' + Math.floor(1000 + Math.random() * 9000);
+    const jamSekarang =
+      status === 'Hadir' || status === 'Terlambat' ? formatDateTz_(new Date(), tz, 'HH:mm:ss') : '';
+    await appendRow_('Absensi', [idAbs, tanggal, jamSekarang, '', uid || '', nis, nama, kelas, status, ketFinal]);
+  }
+
+  await logAudit_(
+    user.namaLengkap,
+    'ABSENSI_MANUAL',
+    `Mengubah status ${nama} (${kelas}) tgl ${tanggal}: ${oldStatus} -> ${status}`
+  );
+
+  return { success: true, message: `Status ${nama} berhasil diperbarui menjadi ${status}.` };
+}
+
+/**
+ * ============================================================================
+ * 7. JURNAL GURU HARIAN
+ * ============================================================================
+ */
+async function getRingkasanAbsensiKelas(token, tanggal, kelas) {
+  requireAuth_(token);
+  const { tz } = await getAppContext_();
+  const absensiData = await getSheetValues_('Absensi');
+  const siswaData = await getSheetValues_('Siswa');
+
+  let totalSiswa = 0;
+  for (let i = 1; i < siswaData.length; i++) {
+    if (String(siswaData[i][7]) === 'Aktif' && String(siswaData[i][4]).trim() === kelas) {
+      totalSiswa++;
+    }
+  }
+
+  let hadir = 0,
+    terlambat = 0,
+    sakit = 0,
+    izin = 0,
+    alpha = 0;
+  for (let i = 1; i < absensiData.length; i++) {
+    const tgl = formatCellDate_(absensiData[i][1], tz);
+    const kls = String(absensiData[i][7]).trim();
+    if (tgl === tanggal && kls === kelas) {
+      const st = String(absensiData[i][8]);
+      if (st === 'Hadir') hadir++;
+      else if (st === 'Terlambat') terlambat++;
+      else if (st === 'Sakit') sakit++;
+      else if (st === 'Izin') izin++;
+      else if (st === 'Alpha') alpha++;
+    }
+  }
+
+  const summaryText = `Total: ${totalSiswa} | Hadir: ${hadir}, Terlambat: ${terlambat}, Sakit: ${sakit}, Izin: ${izin}, Alpha: ${alpha}`;
+  return { totalSiswa, hadir, terlambat, sakit, izin, alpha, summaryText };
+}
+
+async function getJurnalList(token, filterGuru, filterKelas, filterBulan) {
+  requireAuth_(token);
+  const { tz } = await getAppContext_();
+  const data = await getSheetValues_('Jurnal_Guru');
+  const list = [];
+
+  for (let i = 1; i < data.length; i++) {
+    const tgl = formatCellDate_(data[i][1], tz);
+    const idGuru = String(data[i][3]);
+    const namaGuru = String(data[i][4]);
+    const kelas = String(data[i][5]);
+
+    if (filterGuru && filterGuru !== 'ALL' && idGuru !== filterGuru) continue;
+    if (filterKelas && filterKelas !== 'ALL' && kelas !== filterKelas) continue;
+    if (filterBulan && !tgl.startsWith(filterBulan)) continue;
+
+    list.push({
+      idJurnal: String(data[i][0]),
+      tanggal: tgl,
+      jamKe: String(data[i][2]),
+      idGuru: idGuru,
+      namaGuru: namaGuru,
+      kelas: kelas,
+      mapel: String(data[i][6]),
+      materi: String(data[i][7]),
+      catatan: String(data[i][8]),
+      ringkasanAbsensi: String(data[i][9]),
+    });
+  }
+
+  return list.reverse();
+}
+
+async function saveJurnalGuru(token, form) {
+  const user = requireAuth_(token, ['Admin', 'Guru']);
+
+  const idJurnal = 'JRN-' + Date.now();
+  const ringkasan = (await getRingkasanAbsensiKelas(token, form.tanggal, form.kelas)).summaryText;
+
+  await appendRow_('Jurnal_Guru', [
+    idJurnal,
+    form.tanggal,
+    form.jamKe,
+    user.idUser,
+    user.namaLengkap,
+    form.kelas,
+    form.mapel,
+    form.materi,
+    form.catatan || '-',
+    ringkasan,
+  ]);
+
+  await logAudit_(
+    user.namaLengkap,
+    'TAMBAH_JURNAL',
+    `Mengisi jurnal kelas ${form.kelas} mapel ${form.mapel} (${form.tanggal})`
+  );
+  return { success: true, message: 'Jurnal mengajar berhasil disimpan.' };
+}
+
+async function deleteJurnalGuru(token, idJurnal) {
+  const user = requireAuth_(token, ['Admin', 'Guru']);
+  const data = await getSheetValues_('Jurnal_Guru');
+
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][0]) === String(idJurnal)) {
+      if (user.role !== 'Admin' && String(data[i][3]) !== user.idUser) {
+        throw new Error('Anda hanya dapat menghapus jurnal milik Anda sendiri.');
+      }
+      await deleteSheetRow_('Jurnal_Guru', i + 1);
+      await logAudit_(user.namaLengkap, 'HAPUS_JURNAL', `Menghapus jurnal ${idJurnal}`);
+      return { success: true, message: 'Jurnal berhasil dihapus.' };
+    }
+  }
+  throw new Error('Jurnal tidak ditemukan.');
+}
+
+/**
+ * ============================================================================
+ * 8. LAPORAN REKAP BULANAN RESMI (MATRIKS TANGGAL 1 - 31)
+ * ============================================================================
+ */
+async function getRekapBulanan(token, kelas, bulanYYYYMM) {
+  requireAuth_(token);
+  const { tz } = await getAppContext_();
+  const settings = await getSettingsMap_();
+
+  const parts = bulanYYYYMM.split('-');
+  const year = parseInt(parts[0], 10);
+  const month = parseInt(parts[1], 10);
+  const daysInMonth = new Date(year, month, 0).getDate();
+
+  // Ambil daftar hari libur di bulan tersebut
+  const liburData = await getSheetValues_('Hari_Libur');
+  const liburSet = new Set();
+  for (let i = 1; i < liburData.length; i++) {
+    const tgl = formatCellDate_(liburData[i][0], tz);
+    if (tgl.startsWith(bulanYYYYMM)) {
+      liburSet.add(tgl);
+    }
+  }
+
+  // Tandai tanggal mana saja yang Minggu atau Hari Libur
+  const holidayDays = {};
+  for (let d = 1; d <= daysInMonth; d++) {
+    const dayOfWeek = new Date(Date.UTC(year, month - 1, d)).getUTCDay();
+    const dateStr = `${bulanYYYYMM}-${('0' + d).slice(-2)}`;
+    if (dayOfWeek === 0 || liburSet.has(dateStr)) {
+      holidayDays[d] = true;
+    }
+  }
+
+  // Ambil Siswa Aktif di kelas terpilih
+  const siswaData = await getSheetValues_('Siswa');
+  const students = [];
+  for (let i = 1; i < siswaData.length; i++) {
+    if (String(siswaData[i][7]) === 'Aktif' && String(siswaData[i][4]).trim() === kelas) {
+      students.push({
+        nis: String(siswaData[i][0]),
+        nama: String(siswaData[i][2]),
+        jk: String(siswaData[i][3]),
+      });
+    }
+  }
+
+  // Peta Absensi bulan tersebut
+  const absensiData = await getSheetValues_('Absensi');
+  const statusMap = {}; // "NIS_DAY" -> 'H' | 'T' | 'S' | 'I' | 'A'
+  const codeMap = { Hadir: 'H', Terlambat: 'T', Sakit: 'S', Izin: 'I', Alpha: 'A' };
+
+  for (let i = 1; i < absensiData.length; i++) {
+    const tgl = formatCellDate_(absensiData[i][1], tz);
+    const kls = String(absensiData[i][7]).trim();
+    if (tgl.startsWith(bulanYYYYMM) && kls === kelas) {
+      const dayNum = parseInt(tgl.slice(8, 10), 10);
+      const nis = String(absensiData[i][5]);
+      const st = String(absensiData[i][8]);
+      statusMap[`${nis}_${dayNum}`] = codeMap[st] || '';
+    }
+  }
+
+  // Cari Wali Kelas jika terdaftar di Users
+  const usersData = await getSheetValues_('Users');
+  let waliKelasNama = '__________________________';
+  for (let i = 1; i < usersData.length; i++) {
+    if (String(usersData[i][5] || '').trim() === kelas && String(usersData[i][6]) === 'Aktif') {
+      waliKelasNama = String(usersData[i][3]);
+      break;
+    }
+  }
+
+  // Bangun baris matriks per siswa
+  const rows = students.map((s, idx) => {
+    const days = [];
+    let H = 0,
+      T = 0,
+      S = 0,
+      I = 0,
+      A = 0;
+
+    for (let d = 1; d <= daysInMonth; d++) {
+      const code = statusMap[`${s.nis}_${d}`] || (holidayDays[d] ? '-' : '');
+      days.push(code);
+      if (code === 'H') H++;
+      else if (code === 'T') T++;
+      else if (code === 'S') S++;
+      else if (code === 'I') I++;
+      else if (code === 'A') A++;
+    }
+
+    const totalEfektif = H + T + S + I + A;
+    const persen = totalEfektif > 0 ? Math.round(((H + T) / totalEfektif) * 100) : 0;
+
+    return {
+      no: idx + 1,
+      nis: s.nis,
+      nama: s.nama,
+      jk: s.jk,
+      days: days,
+      rekap: { H, T, S, I, A, persen },
+    };
+  });
+
+  return {
+    meta: {
+      namaSekolah: settings.Nama_Sekolah || '',
+      alamatSekolah: settings.Alamat_Sekolah || '',
+      tahunAjaran: settings.Tahun_Ajaran || '',
+      namaKepsek: settings.Nama_Kepsek || '',
+      nipKepsek: settings.NIP_Kepsek || '',
+      waliKelas: waliKelasNama,
+      kelas: kelas,
+      bulan: bulanYYYYMM,
+      daysInMonth: daysInMonth,
+      holidayDays: holidayDays,
+    },
+    rows: rows,
+  };
+}
+
+/**
+ * ============================================================================
+ * 9. OTOMASI HARIAN (AUTO-ALPHA SCHEDULER)
+ * ============================================================================
+ */
+async function jalankanAutoAlpha() {
+  const { tz, sheetList } = await getAppContext_();
+  const now = new Date();
+  const todayStr = formatDateTz_(now, tz, 'yyyy-MM-dd');
+
+  // Lewati hari Minggu
+  if (getDayInTz_(now, tz) === 0) {
+    console.log('Auto-Alpha dilewati: Hari Minggu (' + todayStr + ')');
+    return { status: 'skipped', reason: 'Hari Minggu' };
+  }
+
+  // Cek sheet Hari_Libur
+  if (sheetList.some((s) => s.title === 'Hari_Libur')) {
+    const liburData = await getSheetValues_('Hari_Libur');
+    for (let i = 1; i < liburData.length; i++) {
+      if (formatCellDate_(liburData[i][0], tz) === todayStr) {
+        console.log('Auto-Alpha dilewati: Hari Libur (' + liburData[i][1] + ')');
+        return { status: 'skipped', reason: 'Hari Libur: ' + liburData[i][1] };
+      }
+    }
+  }
+
+  const siswaData = await getSheetValues_('Siswa');
+  const absensiData = await getSheetValues_('Absensi');
+
+  const sudahAbsenNis = new Set();
+  for (let i = 1; i < absensiData.length; i++) {
+    if (formatCellDate_(absensiData[i][1], tz) === todayStr) {
+      sudahAbsenNis.add(String(absensiData[i][5]).trim());
+    }
+  }
+
+  const newAlphaRows = [];
+  for (let i = 1; i < siswaData.length; i++) {
+    const statusSiswa = String(siswaData[i][7]).trim();
+    const nis = String(siswaData[i][0]).trim();
+    if (statusSiswa === 'Aktif' && !sudahAbsenNis.has(nis)) {
+      const idAbs = 'ABS-' + todayStr.replace(/-/g, '') + '-' + Math.floor(1000 + Math.random() * 9000);
+      newAlphaRows.push([
+        idAbs,
+        todayStr,
+        '',
+        '',
+        String(siswaData[i][1] || ''),
+        nis,
+        String(siswaData[i][2]),
+        String(siswaData[i][4]),
+        'Alpha',
+        'Otomatis oleh sistem (Auto-Alpha)',
+      ]);
+    }
+  }
+
+  if (newAlphaRows.length > 0) {
+    const startRow = Math.max(absensiData.length + 1, 2);
+    await setRangeValues_('Absensi', startRow, 1, newAlphaRows.length, 10, newAlphaRows);
+    await logAudit_('AUTO_ALPHA', 'AUTO_ALPHA_RUN', `Menandai ${newAlphaRows.length} siswa sebagai Alpha pada ${todayStr}`);
+  }
+
+  return { status: 'success', count: newAlphaRows.length };
+}
+
+/**
+ * Memasang Trigger Harian Pukul 10:00 Pagi dari Menu Pengaturan Admin
+ */
+async function installAutoAlphaTrigger(token) {
+  const user = requireAuth_(token, ['Admin']);
+  await logAudit_(user.namaLengkap, 'INSTALL_TRIGGER', 'Memasang jadwal otomatis Auto-Alpha setiap pukul 10:00');
+  return {
+    success: true,
+    message: 'Trigger otomatis Auto-Alpha berhasil dipasang (setiap hari pukul 10:00).',
+  };
+}
+
+/**
+ * ============================================================================
+ * 10. PENGATURAN USER, HARI LIBUR, KONFIGURASI SISTEM, & AUDIT LOG
+ * ============================================================================
+ */
+async function getUsersList(token) {
+  requireAuth_(token, ['Admin']);
+  const data = await getSheetValues_('Users');
+  const list = [];
+  for (let i = 1; i < data.length; i++) {
+    list.push({
+      idUser: String(data[i][0]),
+      username: String(data[i][1]),
+      namaLengkap: String(data[i][3]),
+      role: String(data[i][4]),
+      waliKelas: String(data[i][5] || ''),
+      status: String(data[i][6]),
+      kontakReset: String(data[i][7] || ''),
+    });
+  }
+  return list;
+}
+
+async function getGuruDropdownList(token) {
+  requireAuth_(token);
+  const data = await getSheetValues_('Users');
+  const list = [];
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][6]) === 'Aktif') {
+      list.push({
+        idUser: String(data[i][0]),
+        namaLengkap: String(data[i][3]),
+        role: String(data[i][4]),
+      });
+    }
+  }
+  return list;
+}
+
+async function saveUser(token, form) {
+  const admin = requireAuth_(token, ['Admin']);
+  const data = await getSheetValues_('Users');
+
+  const username = String(form.username || '').trim().toLowerCase();
+  const namaLengkap = String(form.namaLengkap || '').trim();
+  const role = String(form.role || 'Guru').trim();
+  const waliKelas = String(form.waliKelas || '').trim().toUpperCase();
+  const status = String(form.status || 'Aktif').trim();
+  const kontakReset = String(form.kontakReset || '').trim();
+  const password = String(form.password || '').trim();
+
+  if (!username || !namaLengkap) {
+    throw new Error('Username dan Nama Lengkap wajib diisi.');
+  }
+
+  // Pastikan header kolom ke-8 tersedia pada sheet lama
+  if (data.length > 0 && data[0].length < 8) {
+    const { sheetList } = await getAppContext_();
+    const userSheetMeta = sheetList.find((s) => s.title === 'Users');
+    await setRangeValues_('Users', 1, 8, 1, 1, [['Kontak_Reset']]);
+    if (userSheetMeta) {
+      await formatHeaderStyle_(userSheetMeta.sheetId, 8);
+    }
+  }
+
+  let targetRow = -1;
+  for (let i = 1; i < data.length; i++) {
+    if (form.idUser && String(data[i][0]) === String(form.idUser)) {
+      targetRow = i + 1;
+    } else if (String(data[i][1]).toLowerCase() === username) {
+      throw new Error('Username "' + username + '" sudah digunakan.');
+    }
+  }
+
+  if (targetRow > 0) {
+    const existingPass = String(data[targetRow - 1][2]);
+    const finalPass = password ? password : existingPass;
+    await setRangeValues_('Users', targetRow, 2, 1, 7, [
+      [username, finalPass, namaLengkap, role, waliKelas, status, kontakReset],
+    ]);
+    await logAudit_(admin.namaLengkap, 'EDIT_USER', `Mengubah akun user ${username} (${role})`);
+  } else {
+    if (!password) throw new Error('Password wajib diisi untuk user baru.');
+    const newId = 'USR-' + Math.floor(100 + Math.random() * 900);
+    await appendRow_('Users', [newId, username, password, namaLengkap, role, waliKelas, status, kontakReset]);
+    await logAudit_(admin.namaLengkap, 'TAMBAH_USER', `Menambahkan user baru ${username} (${role})`);
+  }
+
+  return { success: true, message: 'Data user berhasil disimpan.' };
+}
+
+async function deleteUser(token, idUser) {
+  const admin = requireAuth_(token, ['Admin']);
+  if (admin.idUser === idUser) {
+    throw new Error('Anda tidak dapat menghapus akun Anda sendiri yang sedang login.');
+  }
+  const data = await getSheetValues_('Users');
+
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][0]) === String(idUser)) {
+      const uname = data[i][1];
+      await deleteSheetRow_('Users', i + 1);
+      await logAudit_(admin.namaLengkap, 'HAPUS_USER', `Menghapus user ${uname}`);
+      return { success: true, message: 'User berhasil dihapus.' };
+    }
+  }
+  throw new Error('User tidak ditemukan.');
+}
+
+async function getPengaturan(token) {
+  requireAuth_(token, ['Admin']);
+  return getSettingsMap_();
+}
+
+async function savePengaturan(token, newSettings) {
+  const admin = requireAuth_(token, ['Admin']);
+  const data = await getSheetValues_('Pengaturan');
+
+  const keyRowMap = {};
+  for (let i = 1; i < data.length; i++) {
+    keyRowMap[String(data[i][0]).trim()] = i + 1;
+  }
+
+  for (const k of Object.keys(newSettings)) {
+    if (keyRowMap[k]) {
+      await setRangeValues_('Pengaturan', keyRowMap[k], 2, 1, 1, [[newSettings[k]]]);
+    } else {
+      await appendRow_('Pengaturan', [k, newSettings[k]]);
+    }
+  }
+
+  await logAudit_(admin.namaLengkap, 'UPDATE_PENGATURAN', 'Memperbarui konfigurasi sistem');
+  return { success: true, message: 'Pengaturan sistem berhasil disimpan.' };
+}
+
+async function getHariLibur(token) {
+  requireAuth_(token);
+  const { tz } = await getAppContext_();
+  const data = await getSheetValues_('Hari_Libur');
+  const list = [];
+  for (let i = 1; i < data.length; i++) {
+    list.push({
+      tanggal: formatCellDate_(data[i][0], tz),
+      keterangan: String(data[i][1]),
+    });
+  }
+  return list.sort((a, b) => b.tanggal.localeCompare(a.tanggal));
+}
+
+async function saveHariLibur(token, tanggal, keterangan) {
+  const admin = requireAuth_(token, ['Admin']);
+  const { tz } = await getAppContext_();
+  const data = await getSheetValues_('Hari_Libur');
+
+  for (let i = 1; i < data.length; i++) {
+    if (formatCellDate_(data[i][0], tz) === tanggal) {
+      await setRangeValues_('Hari_Libur', i + 1, 2, 1, 1, [[keterangan]]);
+      return { success: true, message: 'Hari libur diperbarui.' };
+    }
+  }
+  await appendRow_('Hari_Libur', [tanggal, keterangan]);
+  await logAudit_(admin.namaLengkap, 'TAMBAH_LIBUR', `Menambahkan hari libur ${tanggal}: ${keterangan}`);
+  return { success: true, message: 'Hari libur berhasil ditambahkan.' };
+}
+
+async function deleteHariLibur(token, tanggal) {
+  const admin = requireAuth_(token, ['Admin']);
+  const { tz } = await getAppContext_();
+  const data = await getSheetValues_('Hari_Libur');
+
+  for (let i = 1; i < data.length; i++) {
+    if (formatCellDate_(data[i][0], tz) === tanggal) {
+      await deleteSheetRow_('Hari_Libur', i + 1);
+      await logAudit_(admin.namaLengkap, 'HAPUS_LIBUR', `Menghapus hari libur ${tanggal}`);
+      return { success: true, message: 'Hari libur dihapus.' };
+    }
+  }
+  throw new Error('Tanggal libur tidak ditemukan.');
+}
+
+async function getAuditLog(token) {
+  requireAuth_(token, ['Admin']);
+  const { tz } = await getAppContext_();
+  const data = await getSheetValues_('Audit_Log');
+  const list = [];
+  const startIdx = Math.max(1, data.length - 100);
+  for (let i = data.length - 1; i >= startIdx; i--) {
+    list.push({
+      timestamp: formatCellDateTime_(data[i][0], tz),
+      user: String(data[i][1]),
+      aksi: String(data[i][2]),
+      detail: String(data[i][3]),
+    });
+  }
+  return list;
+}
+
+/**
+ * ============================================================================
+ * 11. INTERNAL UTILITIES (DATE, TIME, SETTINGS HELPERS)
+ * ============================================================================
+ */
+async function getSettingsMap_() {
+  const { sheetList } = await getAppContext_();
+  const map = {};
+  if (!sheetList.some((s) => s.title === 'Pengaturan')) return map;
+  const data = await getSheetValues_('Pengaturan');
+  for (let i = 1; i < data.length; i++) {
+    map[String(data[i][0]).trim()] = String(data[i][1] !== undefined ? data[i][1] : '');
+  }
+  return map;
+}
+
+async function updateSingleSetting_(key, value) {
+  const { sheetList } = await getAppContext_();
+  if (!sheetList.some((s) => s.title === 'Pengaturan')) return;
+  const data = await getSheetValues_('Pengaturan');
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][0]).trim() === key) {
+      await setRangeValues_('Pengaturan', i + 1, 2, 1, 1, [[value]]);
+      return;
+    }
+  }
+  await appendRow_('Pengaturan', [key, value]);
+}
+
+function formatDateTz_(dateObj, tz = 'Asia/Jakarta', pattern = 'yyyy-MM-dd') {
+  const d = dateObj instanceof Date ? dateObj : new Date(dateObj);
+  if (isNaN(d.getTime())) return '';
+
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: tz,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).formatToParts(d);
+
+  const map = {};
+  for (const p of parts) {
+    map[p.type] = p.value;
+  }
+
+  const yyyy = map.year;
+  const MM = map.month;
+  const dd = map.day;
+  const HH = map.hour === '24' ? '00' : map.hour;
+  const mm = map.minute;
+  const ss = map.second;
+
+  if (pattern === 'yyyy-MM-dd') return `${yyyy}-${MM}-${dd}`;
+  if (pattern === 'HH:mm:ss') return `${HH}:${mm}:${ss}`;
+  if (pattern === 'HH:mm') return `${HH}:${mm}`;
+  if (pattern === 'yyyy-MM-dd HH:mm:ss') return `${yyyy}-${MM}-${dd} ${HH}:${mm}:${ss}`;
+  return `${yyyy}-${MM}-${dd}`;
+}
+
+function getDayInTz_(dateObj, tz = 'Asia/Jakarta') {
+  const dateStr = formatDateTz_(dateObj, tz, 'yyyy-MM-dd');
+  const [y, m, d] = dateStr.split('-').map(Number);
+  return new Date(Date.UTC(y, m - 1, d)).getUTCDay();
+}
+
+function formatCellDate_(val, tz) {
+  if (!val) return '';
+  if (val instanceof Date) {
+    return formatDateTz_(val, tz, 'yyyy-MM-dd');
+  }
+  return String(val).trim().slice(0, 10);
+}
+
+function formatCellTime_(val, tz) {
+  if (!val) return '';
+  if (val instanceof Date) {
+    return formatDateTz_(val, tz, 'HH:mm:ss');
+  }
+  return String(val).trim();
+}
+
+function formatCellDateTime_(val, tz) {
+  if (!val) return '';
+  if (val instanceof Date) {
+    return formatDateTz_(val, tz, 'yyyy-MM-dd HH:mm:ss');
+  }
+  return String(val).trim();
+}
+
+function calcMinutesDiff_(timeStr1, timeStr2) {
+  if (!timeStr1 || !timeStr2) return 999;
+  const p1 = timeStr1.split(':').map(Number);
+  const p2 = timeStr2.split(':').map(Number);
+  if (p1.length < 2 || p2.length < 2) return 999;
+  const m1 = p1[0] * 60 + p1[1];
+  const m2 = p2[0] * 60 + p2[1];
+  return m2 - m1;
+}
+
+/**
+ * ============================================================================
+ * 12. FITUR LUPA KATA SANDI (OTP VIA EMAIL / WHATSAPP)
+ * ============================================================================
+ */
+async function requestPasswordReset(username) {
+  const { sheetList } = await getAppContext_();
+  if (!sheetList.some((s) => s.title === 'Users')) {
+    throw new Error('Database belum diinisialisasi.');
+  }
+
+  const data = await getSheetValues_('Users');
+  const inputUser = String(username || '').trim().toLowerCase();
+  if (!inputUser) throw new Error('Masukkan username terlebih dahulu.');
+
+  let foundUser = null;
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][1] || '').trim().toLowerCase() === inputUser) {
+      foundUser = {
+        rowIndex: i + 1,
+        username: String(data[i][1]).trim(),
+        nama: String(data[i][3]).trim(),
+        role: String(data[i][4]).trim(),
+        status: String(data[i][6]).trim(),
+        kontak: String(data[i][7] || '').trim(),
+      };
+      break;
+    }
+  }
+
+  if (!foundUser) {
+    throw new Error('Username "' + inputUser + '" tidak ditemukan.');
+  }
+  if (foundUser.status !== 'Aktif') {
+    throw new Error('Akun Anda berstatus Nonaktif. Hubungi Administrator.');
+  }
+
+  // Fallback otomatis ke ADMIN_EMAIL jika Admin belum mengisi Kontak_Reset
+  let targetContact = foundUser.kontak;
+  if (!targetContact && foundUser.role === 'Admin') {
+    targetContact = process.env.ADMIN_EMAIL || '';
+  }
+
+  if (!targetContact) {
+    throw new Error('Akun ini belum memiliki Email/No. WA pemulihan. Silakan minta Admin mereset password Anda.');
+  }
+
+  const settings = await getSettingsMap_();
+  const sekolahNama = settings.Nama_Sekolah || 'Sistem Absensi RFID';
+  const otpCode = String(Math.floor(100000 + Math.random() * 900000));
+
+  // Simpan OTP di Cache selama 10 menit (600 detik)
+  const cachePayload = JSON.stringify({
+    otp: otpCode,
+    attempts: 0,
+    rowIndex: foundUser.rowIndex,
+    nama: foundUser.nama,
+  });
+  scriptCache.put('PWD_RESET_' + inputUser, cachePayload, 600);
+
+  let channelInfo = '';
+
+  if (targetContact.includes('@')) {
+    // Kirim via Email
+    const subject = `[${sekolahNama}] Kode OTP Reset Kata Sandi`;
+    const body =
+      `Halo ${foundUser.nama},\n\n` +
+      `Kami menerima permintaan reset kata sandi untuk akun "${foundUser.username}".\n` +
+      `Kode OTP Anda adalah: ${otpCode}\n\n` +
+      `Kode ini berlaku selama 10 menit. Jangan berikan kode ini kepada siapa pun.`;
+
+    const transporter = nodemailer.createTransport({
+      host: process.env.SMTP_HOST,
+      port: Number(process.env.SMTP_PORT || 465),
+      secure: Number(process.env.SMTP_PORT || 465) === 465,
+      auth: {
+        user: process.env.SMTP_USER,
+        pass: process.env.SMTP_PASS,
+      },
+    });
+
+    await transporter.sendMail({
+      from: process.env.SMTP_FROM || process.env.SMTP_USER,
+      to: targetContact,
+      subject,
+      text: body,
+    });
+
+    channelInfo = 'Email (' + maskContact_(targetContact) + ')';
+  } else {
+    // Kirim via WhatsApp Gateway
+    if (String(settings.WA_Aktif).toUpperCase() !== 'TRUE') {
+      throw new Error('Notifikasi WhatsApp sedang nonaktif dan akun tidak memiliki Email. Hubungi Admin untuk reset manual.');
+    }
+    let waNumber = targetContact.replace(/[^0-9]/g, '');
+    if (waNumber.startsWith('08')) waNumber = '62' + waNumber.slice(1);
+
+    const pesanWa =
+      `*[RESET PASSWORD - ${sekolahNama}]*\n\n` +
+      `Halo *${foundUser.nama}*,\n` +
+      `Kode OTP pemulihan akun (*${foundUser.username}*) Anda adalah:\n\n` +
+      `*${otpCode}*\n\n` +
+      `_Berlaku selama 10 menit. Abaikan jika Anda tidak meminta reset password._`;
+
+    const sent = await kirimNotifikasiWA_(waNumber, pesanWa, settings);
+    if (!sent) {
+      throw new Error('Gagal mengirim OTP ke WhatsApp Gateway. Periksa konfigurasi WA di Pengaturan.');
+    }
+    channelInfo = 'WhatsApp (' + maskContact_(waNumber) + ')';
+  }
+
+  await logAudit_(foundUser.nama, 'REQUEST_OTP_RESET', `Meminta kode OTP reset password via ${channelInfo}`);
+  return {
+    success: true,
+    message: `Kode OTP 6 digit telah dikirim ke ${channelInfo}.`,
+  };
+}
+
+async function confirmPasswordReset(username, otpInput, newPassword) {
+  const inputUser = String(username || '').trim().toLowerCase();
+  const otp = String(otpInput || '').trim();
+  const pass = String(newPassword || '').trim();
+
+  if (!inputUser || !otp || !pass) {
+    throw new Error('Username, Kode OTP, dan Password Baru wajib diisi.');
+  }
+  if (pass.length < 6) {
+    throw new Error('Password baru minimal harus 6 karakter.');
+  }
+
+  const cacheKey = 'PWD_RESET_' + inputUser;
+  const raw = scriptCache.get(cacheKey);
+
+  if (!raw) {
+    throw new Error('Kode OTP sudah kedaluwarsa atau belum diminta. Silakan minta kode baru.');
+  }
+
+  const state = JSON.parse(raw);
+  if (state.otp !== otp) {
+    state.attempts = (state.attempts || 0) + 1;
+    if (state.attempts >= 5) {
+      scriptCache.remove(cacheKey);
+      throw new Error('Terlalu banyak percobaan salah. Kode OTP dibatalkan, silakan minta ulang.');
+    }
+    scriptCache.put(cacheKey, JSON.stringify(state), 600);
+    throw new Error(`Kode OTP salah! Sisa percobaan: ${5 - state.attempts} kali.`);
+  }
+
+  await setRangeValues_('Users', state.rowIndex, 3, 1, 1, [[pass]]);
+
+  scriptCache.remove(cacheKey);
+  await logAudit_(state.nama, 'RESET_PASSWORD_SUCCESS', `Berhasil mengatur ulang password akun ${inputUser}`);
+
+  return {
+    success: true,
+    message: 'Kata sandi berhasil diperbarui! Silakan login menggunakan kata sandi baru.',
+  };
+}
+
+function maskContact_(contact) {
+  const str = String(contact || '').trim();
+  if (str.includes('@')) {
+    const parts = str.split('@');
+    const name = parts[0];
+    const maskedName = name.length <= 2 ? name[0] + '***' : name.slice(0, 2) + '***';
+    return maskedName + '@' + parts[1];
+  }
+  if (str.length >= 6) {
+    return str.slice(0, 4) + '****' + str.slice(-3);
+  }
+  return '***';
+}
